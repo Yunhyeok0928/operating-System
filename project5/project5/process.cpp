@@ -1,3 +1,5 @@
+// 2 - 3 second  커밋시점까지 진행했습니다.
+
 #include <iostream>
 #include <thread>
 #include <mutex>
