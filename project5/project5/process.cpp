@@ -3,11 +3,13 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <list>
 #include <chrono>
 #include <fstream>
 #include <sstream>
 #include <vector>
 #include <cmath>
+#include <algorithm>
 
 using namespace std;
 
@@ -18,31 +20,78 @@ struct Process {
     int duration;
     int period;
     bool promoted = false;
+    int remainingTime = 0;
 };
 
 class Scheduler {
 private:
-    queue<Process> dynamicQueue;
-    queue<Process> waitQueue;
+    list<list<Process>> stack;
+    list<Process> waitQueue;
     mutex mtx;
     condition_variable cv;
     bool stop = false;
     int nextId = 0;
+    size_t threshold = 5;
 
 public:
-    void addProcess(const Process& process) {
+    void enqueue(const Process& process) {
         lock_guard<mutex> lock(mtx);
-        dynamicQueue.push(process);
+        if (stack.empty() || (process.isForeground && stack.front().empty())) {
+            stack.push_front(list<Process>());
+        }
+        if (process.isForeground) {
+            stack.front().push_back(process);
+        }
+        else {
+            if (stack.empty()) {
+                stack.push_back(list<Process>());
+            }
+            stack.back().push_front(process);
+        }
         cv.notify_one();
     }
 
-    void promoteProcess() {
+    Process dequeue() {
         lock_guard<mutex> lock(mtx);
-        if (!dynamicQueue.empty()) {
-            Process p = dynamicQueue.front();
-            dynamicQueue.pop();
-            p.promoted = true;
-            dynamicQueue.push(p);
+        if (stack.empty() || stack.front().empty()) {
+            throw runtime_error("Queue is empty");
+        }
+        Process process = stack.front().front();
+        stack.front().pop_front();
+        if (stack.front().empty()) {
+            stack.pop_front();
+        }
+        return process;
+    }
+
+    void promote() {
+        lock_guard<mutex> lock(mtx);
+        if (stack.empty() || stack.size() == 1) return;
+
+        list<Process>& top = stack.front();
+        list<Process>& bottom = stack.back();
+
+        Process p = top.front();
+        top.pop_front();
+        bottom.push_back(p);
+
+        if (top.empty()) {
+            stack.pop_front();
+        }
+        if (bottom.size() > threshold) {
+            split_n_merge();
+        }
+    }
+
+    void split_n_merge() {
+        lock_guard<mutex> lock(mtx);
+        for (auto it = stack.begin(); it != stack.end(); ++it) {
+            if (it->size() > threshold) {
+                list<Process> new_list;
+                auto mid = next(it->begin(), it->size() / 2);
+                new_list.splice(new_list.begin(), *it, mid, it->end());
+                stack.insert(next(it), new_list);
+            }
         }
     }
 
@@ -51,29 +100,20 @@ public:
         cout << "Running: [1B]" << endl;
         cout << "---------------------------" << endl;
         cout << "DQ: ";
-        queue<Process> tempQueue = dynamicQueue;
-        while (!tempQueue.empty()) {
-            Process p = tempQueue.front();
-            tempQueue.pop();
-            cout << (p.isForeground ? to_string(p.id) + "F" : to_string(p.id) + "B");
-            if (p.promoted) {
-                cout << "*";
-            }
-            if (!tempQueue.empty()) {
+        for (const auto& lst : stack) {
+            for (const auto& p : lst) {
+                cout << (p.isForeground ? to_string(p.id) + "F" : to_string(p.id) + "B");
+                if (p.promoted) {
+                    cout << "*";
+                }
                 cout << " ";
             }
         }
         cout << endl;
         cout << "---------------------------" << endl;
         cout << "WQ: ";
-        tempQueue = waitQueue;
-        while (!tempQueue.empty()) {
-            Process p = tempQueue.front();
-            tempQueue.pop();
-            cout << to_string(p.id) << (p.isForeground ? "F:" : "B:") << p.duration;
-            if (!tempQueue.empty()) {
-                cout << " ";
-            }
+        for (const auto& p : waitQueue) {
+            cout << to_string(p.id) << (p.isForeground ? "F:" : "B:") << p.remainingTime << " ";
         }
         cout << endl;
         cout << "---------------------------" << endl;
@@ -82,11 +122,10 @@ public:
     void schedule() {
         while (!stop) {
             unique_lock<mutex> lock(mtx);
-            cv.wait_for(lock, chrono::seconds(1), [this]() { return !dynamicQueue.empty() || stop; });
+            cv.wait_for(lock, chrono::seconds(1), [this]() { return !stack.empty() || stop; });
 
-            if (!dynamicQueue.empty()) {
-                Process currentProcess = dynamicQueue.front();
-                dynamicQueue.pop();
+            if (!stack.empty()) {
+                Process currentProcess = dequeue();
                 lock.unlock();
 
                 vector<string> args = parseCommand(currentProcess.command);
@@ -95,7 +134,18 @@ public:
                 lock.lock();
                 currentProcess.duration -= 1;
                 if (currentProcess.duration > 0) {
-                    waitQueue.push(currentProcess);
+                    waitQueue.push_back(currentProcess);
+                }
+            }
+
+            for (auto it = waitQueue.begin(); it != waitQueue.end();) {
+                it->remainingTime -= 1;
+                if (it->remainingTime <= 0) {
+                    enqueue(*it);
+                    it = waitQueue.erase(it);
+                }
+                else {
+                    ++it;
                 }
             }
         }
@@ -180,32 +230,41 @@ public:
     }
 };
 
-void CLI(Scheduler& scheduler) {
+void CLI(Scheduler& scheduler, int Y) {
     ifstream file("commands.txt");
     string line;
     int id = 0;
     while (getline(file, line)) {
-        vector<string> commands = scheduler.parseCommand(line);
-        for (const string& cmd : commands) {
-            Process process = { id++, cmd.find('&') != string::npos ? false : true, cmd, 5, 0 };
-            scheduler.addProcess(process);
-            this_thread::sleep_for(chrono::seconds(5)); // Simulate user input interval
+        stringstream ss(line);
+        string cmd;
+        while (getline(ss, cmd, ';')) {
+            vector<string> commands = scheduler.parseCommand(cmd);
+            bool isForeground = true;
+            if (!commands.empty() && commands[0][0] == '&') {
+                isForeground = false;
+                commands[0] = commands[0].substr(1);
+            }
+            Process process = { id++, isForeground, cmd, 5, 0 };
+            scheduler.enqueue(process);
+            this_thread::sleep_for(chrono::seconds(Y));
         }
     }
 }
 
-void monitor(Scheduler& scheduler) {
+void monitor(Scheduler& scheduler, int X) {
     while (true) {
-        this_thread::sleep_for(chrono::seconds(10)); // Simulate monitoring interval
+        this_thread::sleep_for(chrono::seconds(X));
         scheduler.printState();
     }
 }
 
 int main() {
     Scheduler scheduler;
+    int Y = 5; // Shell 프로세스가 명령어를 실행한 후 대기하는 시간 (초)
+    int X = 20; // Monitor 프로세스가 상태를 출력하는 간격 (초)
 
-    thread cliThread(CLI, ref(scheduler));
-    thread monitorThread(monitor, ref(scheduler));
+    thread cliThread(CLI, ref(scheduler), Y);
+    thread monitorThread(monitor, ref(scheduler), X);
     thread schedulerThread(&Scheduler::schedule, &scheduler);
 
     cliThread.join();
